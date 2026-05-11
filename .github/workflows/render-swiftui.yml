@@ -1,0 +1,120 @@
+name: Render SwiftUI to PNG
+
+on:
+  repository_dispatch:
+    types: [render-swiftui]
+  workflow_dispatch:
+    inputs:
+      swift_code_b64:
+        description: 'Base64-encoded SwiftUI code (containing a struct conforming to View named ContentView)'
+        required: true
+      view_width:
+        description: 'Screenshot width (pt)'
+        default: '390'
+      view_height:
+        description: 'Screenshot height (pt)'
+        default: '844'
+
+jobs:
+  render:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - name: Decode input
+        id: decode
+        run: |
+          if [ -n "${{ github.event.client_payload.swift_code_b64 }}" ]; then
+            CODE_B64="${{ github.event.client_payload.swift_code_b64 }}"
+            JOB_ID="${{ github.event.client_payload.job_id }}"
+          else
+            CODE_B64="${{ inputs.swift_code_b64 }}"
+            JOB_ID="manual-$(date +%s)"
+          fi
+          echo "job_id=$JOB_ID" >> $GITHUB_OUTPUT
+          mkdir -p Runner
+          echo "$CODE_B64" | base64 -d > Runner/ContentView.swift
+          echo "── Decoded SwiftUI ──"
+          head -30 Runner/ContentView.swift
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Generate Xcode project
+        run: |
+          cat > Runner/RunnerApp.swift <<'EOF'
+          import SwiftUI
+
+          @main
+          struct RunnerApp: App {
+              var body: some Scene {
+                  WindowGroup {
+                      ContentView()
+                  }
+              }
+          }
+          EOF
+
+          cat > project.yml <<'EOF'
+          name: Runner
+          options:
+            bundleIdPrefix: com.swiftui.renderer
+            deploymentTarget:
+              iOS: '17.0'
+            xcodeVersion: '15.0'
+          targets:
+            Runner:
+              type: application
+              platform: iOS
+              sources: [Runner]
+              info:
+                path: Runner/Info.plist
+                properties:
+                  UILaunchScreen: {}
+          EOF
+
+          brew install xcodegen
+          xcodegen --version
+          xcodegen generate
+          ls -la Runner.xcodeproj/ || echo "NO PROJECT"
+
+      - name: Boot simulator
+        run: |
+          # 选第一个可用的 iPhone 设备（不锁版本，让 runner 自己选）
+          DEVICE_ID=$(xcrun simctl list devices available -j | python3 -c "
+          import json, sys
+          d = json.load(sys.stdin)
+          for runtime, devs in d['devices'].items():
+              if 'iOS' not in runtime: continue
+              for x in devs:
+                  if x.get('isAvailable') and 'iPhone' in x['name']:
+                      print(x['udid']); sys.exit(0)
+          ")
+          echo "DEVICE_ID=$DEVICE_ID"
+          echo "DEVICE_ID=$DEVICE_ID" >> $GITHUB_ENV
+          xcrun simctl boot "$DEVICE_ID" || true
+          xcrun simctl bootstatus "$DEVICE_ID" -b
+
+      - name: Build & install app
+        run: |
+          set -o pipefail
+          xcodebuild -project Runner.xcodeproj -scheme Runner \
+            -destination "id=$DEVICE_ID" \
+            -derivedDataPath build \
+            build CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO 2>&1 | tail -50
+          APP_PATH=$(find build -name "Runner.app" -type d | head -1)
+          echo "APP_PATH=$APP_PATH"
+          xcrun simctl install "$DEVICE_ID" "$APP_PATH"
+          xcrun simctl launch "$DEVICE_ID" com.swiftui.renderer.Runner
+          sleep 3
+
+      - name: Screenshot
+        run: |
+          xcrun simctl io "$DEVICE_ID" screenshot screen.png
+          ls -la screen.png
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rendered-${{ steps.decode.outputs.job_id }}
+          path: screen.png
+          retention-days: 1
