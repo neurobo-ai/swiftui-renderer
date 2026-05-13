@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       swift_code_b64:
-        description: 'Base64-encoded SwiftUI code containing some struct conforming to View'
+        description: 'Base64-encoded SwiftUI code'
         required: true
       root_view:
         description: 'Name of the View struct to launch (default ContentView)'
@@ -32,13 +32,10 @@ jobs:
           [ -z "$ROOT_VIEW" ] && ROOT_VIEW="ContentView"
           echo "job_id=$JOB_ID" >> $GITHUB_OUTPUT
           echo "root_view=$ROOT_VIEW" >> $GITHUB_OUTPUT
-          mkdir -p Runner
+          mkdir -p Runner output
           echo "$CODE_B64" | base64 -d > Runner/UserView.swift
-          echo "── Decoded SwiftUI (root_view=$ROOT_VIEW) ──"
-          head -20 Runner/UserView.swift
-
-      - name: Show Xcode version
-        run: xcodebuild -version
+          # 输出文件夹兜底，确保即使后面失败也有东西可上传
+          echo "Build not yet started" > output/build-error.txt
 
       - name: Generate Xcode project
         run: |
@@ -55,8 +52,6 @@ jobs:
               }
           }
           EOF
-          echo "── RunnerApp.swift ──"
-          cat Runner/RunnerApp.swift
 
           cat > project.yml <<'EOF'
           name: Runner
@@ -76,10 +71,8 @@ jobs:
                   UILaunchScreen: {}
           EOF
 
-          brew install xcodegen
-          xcodegen --version
+          brew install xcodegen > /dev/null
           xcodegen generate
-          ls -la Runner.xcodeproj/ || echo "NO PROJECT"
 
       - name: Boot simulator
         run: |
@@ -92,32 +85,52 @@ jobs:
                   if x.get('isAvailable') and 'iPhone' in x['name']:
                       print(x['udid']); sys.exit(0)
           ")
-          echo "DEVICE_ID=$DEVICE_ID"
           echo "DEVICE_ID=$DEVICE_ID" >> $GITHUB_ENV
           xcrun simctl boot "$DEVICE_ID" || true
-          xcrun simctl bootstatus "$DEVICE_ID" -b
+          xcrun simctl bootstatus "$DEVICE_ID" -b &
+          # 不等待 bootstatus 完成，让它后台启动节省时间
 
-      - name: Build & install app
+      - name: Build app
+        id: build
+        continue-on-error: true
         run: |
-          set -o pipefail
+          set +e
           xcodebuild -project Runner.xcodeproj -scheme Runner \
             -destination "id=$DEVICE_ID" \
             -derivedDataPath build \
-            build CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO 2>&1 | tail -50
+            build CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO \
+            > build.log 2>&1
+          BUILD_EXIT=$?
+          echo "build_exit=$BUILD_EXIT" >> $GITHUB_OUTPUT
+
+          if [ "$BUILD_EXIT" -ne 0 ]; then
+            # 提取关键编译错误（最多 50 行 error:/warning:）
+            echo "── Build FAILED (exit=$BUILD_EXIT) ──" > output/build-error.txt
+            grep -E "(error:|warning:|BUILD FAILED)" build.log | head -50 >> output/build-error.txt || true
+            echo "" >> output/build-error.txt
+            echo "── Last 30 lines of build.log ──" >> output/build-error.txt
+            tail -30 build.log >> output/build-error.txt
+            cat output/build-error.txt
+          else
+            rm -f output/build-error.txt
+          fi
+
+      - name: Install & launch app & screenshot
+        if: steps.build.outputs.build_exit == '0'
+        run: |
+          # 等 simulator 启动好
+          xcrun simctl bootstatus "$DEVICE_ID" -b
           APP_PATH=$(find build -name "Runner.app" -type d | head -1)
-          echo "APP_PATH=$APP_PATH"
           xcrun simctl install "$DEVICE_ID" "$APP_PATH"
           xcrun simctl launch "$DEVICE_ID" com.swiftui.renderer.Runner
           sleep 3
-
-      - name: Screenshot
-        run: |
-          xcrun simctl io "$DEVICE_ID" screenshot screen.png
-          ls -la screen.png
+          xcrun simctl io "$DEVICE_ID" screenshot output/screen.png
+          ls -la output/
 
       - name: Upload artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: rendered-${{ steps.decode.outputs.job_id }}
-          path: screen.png
+          path: output/
           retention-days: 1
