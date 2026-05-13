@@ -12,6 +12,11 @@ on:
         description: 'Name of the View struct to launch (default ContentView)'
         default: 'ContentView'
 
+# 同一 root_view+ 仓库共享 DerivedData，能让 Swift module 缓存命中
+concurrency:
+  group: render-swiftui-${{ github.event.client_payload.root_view || inputs.root_view || 'ContentView' }}
+  cancel-in-progress: false
+
 jobs:
   render:
     runs-on: macos-latest
@@ -34,8 +39,35 @@ jobs:
           echo "root_view=$ROOT_VIEW" >> $GITHUB_OUTPUT
           mkdir -p Runner output
           echo "$CODE_B64" | base64 -d > Runner/UserView.swift
-          # 输出文件夹兜底，确保即使后面失败也有东西可上传
           echo "Build not yet started" > output/build-error.txt
+
+      # 缓存 Homebrew xcodegen 二进制（节省 brew install ~10s）
+      - name: Cache xcodegen
+        id: cache-xcodegen
+        uses: actions/cache@v4
+        with:
+          path: |
+            /opt/homebrew/Cellar/xcodegen
+            /opt/homebrew/bin/xcodegen
+          key: xcodegen-v245-${{ runner.os }}
+
+      # 缓存 DerivedData（SwiftUI/Foundation 等系统库的 module cache，节省 ~60-90s）
+      # key 包含 RunnerApp.swift 内容是因为 root_view 变了项目就变了
+      - name: Cache DerivedData
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/Build/Intermediates.noindex
+            build/ModuleCache.noindex
+            build/SourcePackages
+            ~/Library/Developer/Xcode/DerivedData/ModuleCache.noindex
+          key: deriveddata-${{ runner.os }}-${{ steps.decode.outputs.root_view }}-v3
+          restore-keys: |
+            deriveddata-${{ runner.os }}-
+
+      - name: Install xcodegen (if not cached)
+        if: steps.cache-xcodegen.outputs.cache-hit != 'true'
+        run: brew install xcodegen > /dev/null
 
       - name: Generate Xcode project
         run: |
@@ -60,6 +92,11 @@ jobs:
             deploymentTarget:
               iOS: '17.0'
             xcodeVersion: '15.0'
+          settings:
+            base:
+              COMPILER_INDEX_STORE_ENABLE: 'NO'
+              SWIFT_COMPILATION_MODE: 'singlefile'
+              DEBUG_INFORMATION_FORMAT: 'dwarf'
           targets:
             Runner:
               type: application
@@ -70,11 +107,10 @@ jobs:
                 properties:
                   UILaunchScreen: {}
           EOF
-
-          brew install xcodegen > /dev/null
           xcodegen generate
 
-      - name: Boot simulator
+      # 并发：booting simulator 和 build 同时启
+      - name: Boot simulator (async)
         run: |
           DEVICE_ID=$(xcrun simctl list devices available -j | python3 -c "
           import json, sys
@@ -86,25 +122,27 @@ jobs:
                       print(x['udid']); sys.exit(0)
           ")
           echo "DEVICE_ID=$DEVICE_ID" >> $GITHUB_ENV
-          xcrun simctl boot "$DEVICE_ID" || true
-          xcrun simctl bootstatus "$DEVICE_ID" -b &
-          # 不等待 bootstatus 完成，让它后台启动节省时间
+          xcrun simctl boot "$DEVICE_ID" > /dev/null 2>&1 &
+          echo $! > /tmp/boot.pid
 
-      - name: Build app
+      - name: Build app (fast)
         id: build
         continue-on-error: true
         run: |
           set +e
+          # COMPILER_INDEX_STORE_ENABLE=NO 关索引；singlefile 模式更适合频繁改的小代码
           xcodebuild -project Runner.xcodeproj -scheme Runner \
             -destination "id=$DEVICE_ID" \
             -derivedDataPath build \
-            build CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO \
-            > build.log 2>&1
-          BUILD_EXIT=$?
+            -disableAutomaticPackageResolution \
+            -skipPackagePluginValidation \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO \
+            build 2>&1 | tail -80 > build.log
+          BUILD_EXIT=${PIPESTATUS[0]}
           echo "build_exit=$BUILD_EXIT" >> $GITHUB_OUTPUT
 
           if [ "$BUILD_EXIT" -ne 0 ]; then
-            # 提取关键编译错误（最多 50 行 error:/warning:）
             echo "── Build FAILED (exit=$BUILD_EXIT) ──" > output/build-error.txt
             grep -E "(error:|warning:|BUILD FAILED)" build.log | head -50 >> output/build-error.txt || true
             echo "" >> output/build-error.txt
@@ -118,14 +156,13 @@ jobs:
       - name: Install & launch app & screenshot
         if: steps.build.outputs.build_exit == '0'
         run: |
-          # 等 simulator 启动好
+          # 确保 simulator 已 booted
           xcrun simctl bootstatus "$DEVICE_ID" -b
           APP_PATH=$(find build -name "Runner.app" -type d | head -1)
           xcrun simctl install "$DEVICE_ID" "$APP_PATH"
           xcrun simctl launch "$DEVICE_ID" com.swiftui.renderer.Runner
-          sleep 3
+          sleep 2
           xcrun simctl io "$DEVICE_ID" screenshot output/screen.png
-          ls -la output/
 
       - name: Upload artifact
         if: always()
