@@ -6,14 +6,11 @@ on:
   workflow_dispatch:
     inputs:
       swift_code_b64:
-        description: 'Base64-encoded SwiftUI code (containing a struct conforming to View named ContentView)'
+        description: 'Base64-encoded SwiftUI code containing some struct conforming to View'
         required: true
-      view_width:
-        description: 'Screenshot width (pt)'
-        default: '390'
-      view_height:
-        description: 'Screenshot height (pt)'
-        default: '844'
+      root_view:
+        description: 'Name of the View struct to launch (default ContentView)'
+        default: 'ContentView'
 
 jobs:
   render:
@@ -26,33 +23,40 @@ jobs:
           if [ -n "${{ github.event.client_payload.swift_code_b64 }}" ]; then
             CODE_B64="${{ github.event.client_payload.swift_code_b64 }}"
             JOB_ID="${{ github.event.client_payload.job_id }}"
+            ROOT_VIEW="${{ github.event.client_payload.root_view }}"
           else
             CODE_B64="${{ inputs.swift_code_b64 }}"
             JOB_ID="manual-$(date +%s)"
+            ROOT_VIEW="${{ inputs.root_view }}"
           fi
+          [ -z "$ROOT_VIEW" ] && ROOT_VIEW="ContentView"
           echo "job_id=$JOB_ID" >> $GITHUB_OUTPUT
+          echo "root_view=$ROOT_VIEW" >> $GITHUB_OUTPUT
           mkdir -p Runner
-          echo "$CODE_B64" | base64 -d > Runner/ContentView.swift
-          echo "── Decoded SwiftUI ──"
-          head -30 Runner/ContentView.swift
+          echo "$CODE_B64" | base64 -d > Runner/UserView.swift
+          echo "── Decoded SwiftUI (root_view=$ROOT_VIEW) ──"
+          head -20 Runner/UserView.swift
 
       - name: Show Xcode version
         run: xcodebuild -version
 
       - name: Generate Xcode project
         run: |
-          cat > Runner/RunnerApp.swift <<'EOF'
+          ROOT_VIEW="${{ steps.decode.outputs.root_view }}"
+          cat > Runner/RunnerApp.swift <<EOF
           import SwiftUI
 
           @main
           struct RunnerApp: App {
               var body: some Scene {
                   WindowGroup {
-                      ContentView()
+                      $ROOT_VIEW()
                   }
               }
           }
           EOF
+          echo "── RunnerApp.swift ──"
+          cat Runner/RunnerApp.swift
 
           cat > project.yml <<'EOF'
           name: Runner
@@ -79,7 +83,6 @@ jobs:
 
       - name: Boot simulator
         run: |
-          # 选第一个可用的 iPhone 设备（不锁版本，让 runner 自己选）
           DEVICE_ID=$(xcrun simctl list devices available -j | python3 -c "
           import json, sys
           d = json.load(sys.stdin)
