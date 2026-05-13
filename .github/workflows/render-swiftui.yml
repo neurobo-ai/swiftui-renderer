@@ -12,10 +12,6 @@ on:
         description: 'Name of the View struct to launch (default ContentView)'
         default: 'ContentView'
 
-concurrency:
-  group: render-swiftui-${{ github.event.client_payload.root_view || inputs.root_view || 'ContentView' }}
-  cancel-in-progress: false
-
 jobs:
   render:
     runs-on: macos-latest
@@ -40,29 +36,15 @@ jobs:
           echo "$CODE_B64" | base64 -d > Runner/UserView.swift
           echo "Build not yet started" > output/build-error.txt
 
-      - name: Cache xcodegen
-        id: cache-xcodegen
+      # 只缓存全局 Module Cache（SwiftUI/Foundation 等系统库的预编译产物）
+      # 不缓存本地 build/，每次 fresh build 避免污染
+      - name: Cache Swift Module Cache
         uses: actions/cache@v4
         with:
-          path: |
-            /opt/homebrew/Cellar/xcodegen
-            /opt/homebrew/bin/xcodegen
-          key: xcodegen-v245-${{ runner.os }}
-
-      # 缓存 Xcode DerivedData：SwiftUI/Foundation 等系统库的 module cache
-      # 不同 root_view 各自一份；同 root_view 内连续运行能命中
-      - name: Cache DerivedData
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/Library/Developer/Xcode/DerivedData/ModuleCache.noindex
-          key: deriveddata-v4-${{ runner.os }}-${{ steps.decode.outputs.root_view }}
+          path: ~/Library/Developer/Xcode/DerivedData/ModuleCache.noindex
+          key: swift-modcache-v1-${{ runner.os }}
           restore-keys: |
-            deriveddata-v4-${{ runner.os }}-
-
-      - name: Install xcodegen (if not cached)
-        if: steps.cache-xcodegen.outputs.cache-hit != 'true'
-        run: brew install xcodegen > /dev/null
+            swift-modcache-v1-
 
       - name: Generate Xcode project
         run: |
@@ -97,10 +79,13 @@ jobs:
                 properties:
                   UILaunchScreen: {}
           EOF
-          xcodegen generate
 
-      # 并发：booting simulator 和 build 同时启
-      - name: Boot simulator (async)
+          brew install xcodegen > /dev/null
+          xcodegen --version
+          xcodegen generate
+          ls -la Runner.xcodeproj/ || echo "NO PROJECT"
+
+      - name: Boot simulator (parallel)
         run: |
           DEVICE_ID=$(xcrun simctl list devices available -j | python3 -c "
           import json, sys
@@ -114,21 +99,15 @@ jobs:
           echo "DEVICE_ID=$DEVICE_ID" >> $GITHUB_ENV
           xcrun simctl boot "$DEVICE_ID" > /dev/null 2>&1 &
 
-      - name: Build app (fast)
+      - name: Build app
         id: build
         continue-on-error: true
         run: |
           set +e
-          # 命令行传 build settings 不破坏 xcodegen 默认配置：
-          # COMPILER_INDEX_STORE_ENABLE=NO 关索引
-          # SWIFT_COMPILATION_MODE=singlefile 增量编译更快
           xcodebuild -project Runner.xcodeproj -scheme Runner \
             -destination "id=$DEVICE_ID" \
             -derivedDataPath build \
-            -disableAutomaticPackageResolution \
-            -skipPackagePluginValidation \
             COMPILER_INDEX_STORE_ENABLE=NO \
-            SWIFT_COMPILATION_MODE=singlefile \
             CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO \
             build 2>&1 > build.log
           BUILD_EXIT=$?
@@ -145,7 +124,7 @@ jobs:
             rm -f output/build-error.txt
           fi
 
-      - name: Install & launch app & screenshot
+      - name: Install & launch & screenshot
         if: steps.build.outputs.build_exit == '0'
         run: |
           xcrun simctl bootstatus "$DEVICE_ID" -b
