@@ -55,7 +55,6 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            build/Build/Intermediates.noindex
             ~/Library/Developer/Xcode/DerivedData/ModuleCache.noindex
           key: deriveddata-v4-${{ runner.os }}-${{ steps.decode.outputs.root_view }}
           restore-keys: |
