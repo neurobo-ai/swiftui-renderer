@@ -94,6 +94,7 @@ jobs:
             xcodeVersion: '15.0'
           settings:
             base:
+              SWIFT_VERSION: '5.0'
               COMPILER_INDEX_STORE_ENABLE: 'NO'
               SWIFT_COMPILATION_MODE: 'singlefile'
               DEBUG_INFORMATION_FORMAT: 'dwarf'
