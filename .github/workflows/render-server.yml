@@ -1,0 +1,120 @@
+name: SwiftUI Render Server (long-running)
+
+on:
+  repository_dispatch:
+    types: [start-render-server]
+  workflow_dispatch:
+    inputs:
+      session_id:
+        required: true
+      max_idle_seconds:
+        default: '180'
+      max_total_minutes:
+        default: '55'
+
+concurrency:
+  group: render-server-${{ github.event.client_payload.session_id || inputs.session_id }}
+  cancel-in-progress: false
+
+jobs:
+  server:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout (for scripts/render_server_loop.py)
+        uses: actions/checkout@v4
+
+      - name: Parse inputs
+        id: parse
+        run: |
+          if [ -n "${{ github.event.client_payload.session_id }}" ]; then
+            SESSION_ID="${{ github.event.client_payload.session_id }}"
+            MAX_IDLE="${{ github.event.client_payload.max_idle_seconds }}"
+            MAX_TOTAL="${{ github.event.client_payload.max_total_minutes }}"
+          else
+            SESSION_ID="${{ inputs.session_id }}"
+            MAX_IDLE="${{ inputs.max_idle_seconds }}"
+            MAX_TOTAL="${{ inputs.max_total_minutes }}"
+          fi
+          [ -z "$MAX_IDLE" ] && MAX_IDLE=180
+          [ -z "$MAX_TOTAL" ] && MAX_TOTAL=55
+          echo "session_id=$SESSION_ID" >> $GITHUB_OUTPUT
+          echo "max_idle=$MAX_IDLE" >> $GITHUB_OUTPUT
+          echo "max_total=$MAX_TOTAL" >> $GITHUB_OUTPUT
+
+      - name: Setup base Xcode project (warmup placeholder)
+        run: |
+          mkdir -p Runner
+          cat > Runner/UserView.swift << 'EOS'
+          import SwiftUI
+          struct PlaceholderView: View {
+              var body: some View { Text("warmup") }
+          }
+          EOS
+          cat > Runner/RunnerApp.swift << 'EOS'
+          import SwiftUI
+
+          @main
+          struct RunnerApp: App {
+              var body: some Scene {
+                  WindowGroup { PlaceholderView() }
+              }
+          }
+          EOS
+          cat > project.yml << 'EOS'
+          name: Runner
+          options:
+            bundleIdPrefix: com.swiftui.renderer
+            deploymentTarget:
+              iOS: '17.0'
+            xcodeVersion: '15.0'
+          targets:
+            Runner:
+              type: application
+              platform: iOS
+              sources: [Runner]
+              info:
+                path: Runner/Info.plist
+                properties:
+                  UILaunchScreen: {}
+          EOS
+          brew install xcodegen > /dev/null
+          xcodegen generate
+
+      - name: Boot simulator
+        run: |
+          DEVICE_ID=$(xcrun simctl list devices available -j | python3 -c "
+          import json, sys
+          d = json.load(sys.stdin)
+          for runtime, devs in d['devices'].items():
+              if 'iOS' not in runtime: continue
+              for x in devs:
+                  if x.get('isAvailable') and 'iPhone' in x['name']:
+                      print(x['udid']); sys.exit(0)
+          ")
+          echo "DEVICE_ID=$DEVICE_ID" >> $GITHUB_ENV
+          xcrun simctl boot "$DEVICE_ID" || true
+          xcrun simctl bootstatus "$DEVICE_ID" -b
+
+      - name: Warmup compile (one-time cold build)
+        run: |
+          xcodebuild -project Runner.xcodeproj -scheme Runner \
+            -destination "id=$DEVICE_ID" \
+            -derivedDataPath build \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO \
+            build 2>&1 | tail -10
+
+      - name: Install Python redis
+        run: pip3 install --quiet --break-system-packages redis || pip3 install --quiet redis
+
+      - name: Render loop
+        env:
+          REDIS_HOST: ${{ secrets.REDIS_HOST }}
+          REDIS_PORT: ${{ secrets.REDIS_PORT }}
+          REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
+          REDIS_TLS: ${{ secrets.REDIS_TLS }}
+          SESSION_ID: ${{ steps.parse.outputs.session_id }}
+          MAX_IDLE: ${{ steps.parse.outputs.max_idle }}
+          MAX_TOTAL_MIN: ${{ steps.parse.outputs.max_total }}
+        run: python3 scripts/render_server_loop.py
