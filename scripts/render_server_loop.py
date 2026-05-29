@@ -13,6 +13,11 @@ def main():
         ssl=os.environ.get("REDIS_TLS", "").lower() == "true",
         decode_responses=True,
         socket_keepalive=True,
+        # 防 SSL/网络抖动：BRPOP 阻塞 5s，socket_timeout 给 30s 双保险
+        socket_timeout=30,
+        socket_connect_timeout=10,
+        health_check_interval=60,
+        retry_on_timeout=True,
     )
 
     session = os.environ["SESSION_ID"]
@@ -27,7 +32,11 @@ def main():
     rendered = 0
 
     def heartbeat():
-        rc.setex(heartbeat_key, 60, "alive")
+        try:
+            rc.setex(heartbeat_key, 60, "alive")
+        except Exception as _e:
+            # heartbeat 失败不致命（下次循环会重试）；崩进程会让上游等 360s 才降级
+            print(f"[Server] heartbeat failed (will retry): {_e}", flush=True)
 
     heartbeat()
     print(f"[Server] ready session={session}, polling {queue_key}", flush=True)
@@ -41,7 +50,16 @@ def main():
             break
 
         heartbeat()
-        result = rc.brpop(queue_key, timeout=5)
+        try:
+            result = rc.brpop(queue_key, timeout=5)
+        except (redis.exceptions.TimeoutError,
+                redis.exceptions.ConnectionError,
+                redis.exceptions.ResponseError) as _e:
+            # 跨境 SSL 抖动 / Redis 配额满 / 网络瞬断 → 不崩进程，下次循环重试
+            # 之前 server 在 1 个 job 后就因这里抛异常退出，导致每轮都重新等 200s+ 启动
+            print(f"[Server] brpop network blip: {_e}, retry in 1s", flush=True)
+            time.sleep(1)
+            continue
         if not result:
             continue
 
